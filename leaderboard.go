@@ -147,7 +147,7 @@ type Stats struct {
 }
 
 func processRepositories(client *github.Client, options *Options, repos chan *github.Repository, stats chan *Stats) {
-	fmt.Printf("Processing data since %v matching repository name pattern %s", options.Since, options.NamePattern)
+	fmt.Printf("Processing data since %v matching repository name pattern %s\n", options.Since, options.NamePattern)
 
 	var wg sync.WaitGroup
 	for repo := range repos {
@@ -282,6 +282,7 @@ func showResults(statsPerUser map[string]*Stats) {
 		t.AppendRow(table.Row{stats.Name, stats.PullRequests, stats.Reviews, stats.Comments, stats.CommentLinesWritten})
 	}
 
+	fmt.Println()
 	fmt.Println(t.Render())
 }
 
