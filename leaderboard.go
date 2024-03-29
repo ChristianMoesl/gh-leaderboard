@@ -6,18 +6,27 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net/http"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cli/go-gh/pkg/auth"
 	"github.com/gofri/go-github-ratelimit/github_ratelimit"
+	"github.com/jedib0t/go-pretty/progress"
 	"github.com/jedib0t/go-pretty/table"
 
 	"github.com/google/go-github/v60/github"
+)
+
+var (
+	amountOfRequests   atomic.Uint64
+	ratelimitRemaining atomic.Uint64
+	ratelimitReset     atomic.Pointer[github.Timestamp]
 )
 
 func fetchRepositories(client *github.Client, options *Options, clientNumber int, totalClients int, repos chan *github.Repository) {
@@ -56,6 +65,8 @@ func processPullRequest(client *github.Client, options *Options, repo *github.Re
 	if err != nil {
 		panic(err)
 	}
+	ratelimitRemaining.Store(uint64(response.Rate.Remaining))
+	ratelimitReset.Store(&response.Rate.Reset)
 	if response.NextPage != 0 {
 		log.Fatalf("Found to many reviews in pull request %s/%s#%d to handle\n", repo.GetOwner().GetLogin(), repo.GetName(), pr.GetNumber())
 	}
@@ -83,6 +94,8 @@ func processPullRequest(client *github.Client, options *Options, repo *github.Re
 		if err != nil {
 			panic(err)
 		}
+		ratelimitRemaining.Store(uint64(response.Rate.Remaining))
+		ratelimitReset.Store(&response.Rate.Reset)
 
 		for _, comment := range comments {
 			if comment.GetCreatedAt().After(options.Since) {
@@ -103,9 +116,11 @@ func processPullRequest(client *github.Client, options *Options, repo *github.Re
 	}
 }
 
-func processRepository(client *github.Client, options *Options, repo *github.Repository, stats chan *Stats) {
+func processRepository(client *github.Client, pw progress.Writer, options *Options, repo *github.Repository, stats chan *Stats) {
 	slog.Debug("Fetch pull requests", "repository", repo.GetName())
+
 	page := 0
+	var tracker progress.Tracker
 	for {
 		pullRequests, response, err := client.PullRequests.List(context.Background(), repo.GetOwner().GetLogin(), repo.GetName(), &github.PullRequestListOptions{
 			State:     "all",
@@ -118,6 +133,14 @@ func processRepository(client *github.Client, options *Options, repo *github.Rep
 		if err != nil {
 			panic(err)
 		}
+		ratelimitRemaining.Store(uint64(response.Rate.Remaining))
+		ratelimitReset.Store(&response.Rate.Reset)
+
+		if page == 0 {
+			tracker = progress.Tracker{Message: repo.GetName(), Total: int64(response.LastPage)}
+			pw.AppendTracker(&tracker)
+		}
+		tracker.Increment(1)
 
 		var wg sync.WaitGroup
 		for _, pullRequest := range pullRequests {
@@ -132,6 +155,8 @@ func processRepository(client *github.Client, options *Options, repo *github.Rep
 		wg.Wait()
 
 		if response.NextPage == 0 {
+			tracker.Increment(1)
+			tracker.MarkAsDone()
 			return
 		}
 		page = response.NextPage
@@ -146,7 +171,7 @@ type Stats struct {
 	CommentLinesWritten int
 }
 
-func processRepositories(client *github.Client, options *Options, repos chan *github.Repository, stats chan *Stats) {
+func processRepositories(client *github.Client, pw progress.Writer, options *Options, repos chan *github.Repository, stats chan *Stats) {
 	fmt.Printf("Processing data since %v matching repository name pattern %s\n", options.Since, options.NamePattern)
 
 	var wg sync.WaitGroup
@@ -159,12 +184,24 @@ func processRepositories(client *github.Client, options *Options, repos chan *gi
 			wg.Add(1)
 			go func(repo *github.Repository) {
 				defer wg.Done()
-				processRepository(client, options, repo, stats)
+				processRepository(client, pw, options, repo, stats)
 			}(repo)
 		}
 	}
 	wg.Wait()
 	close(stats)
+}
+
+type CountingRoundTripper struct {
+	Proxied http.RoundTripper
+}
+
+func (crt CountingRoundTripper) RoundTrip(req *http.Request) (res *http.Response, e error) {
+	res, e = crt.Proxied.RoundTrip(req)
+
+	amountOfRequests.Add(1)
+
+	return res, e
 }
 
 func createClient() *github.Client {
@@ -174,7 +211,8 @@ func createClient() *github.Client {
 		log.Fatalf("authentication token not found for host %s", host)
 	}
 
-	rateLimiter, err := github_ratelimit.NewRateLimitWaiterClient(nil)
+	roundTrip := CountingRoundTripper{http.DefaultTransport}
+	rateLimiter, err := github_ratelimit.NewRateLimitWaiterClient(roundTrip)
 	if err != nil {
 		panic(err)
 	}
@@ -287,6 +325,12 @@ func showResults(statsPerUser map[string]*Stats) {
 }
 
 func main() {
+	pw := progress.NewWriter()
+	pw.SetSortBy(progress.SortByPercentDsc)
+	pw.SetStyle(progress.StyleDefault)
+	pw.Style().Colors = progress.StyleColorsDefault
+	go pw.Render()
+
 	initializedLogger()
 
 	options := parseCliArgs()
@@ -297,9 +341,14 @@ func main() {
 	go fetchAllRepositories(client, options, repos, 5)
 
 	stats := make(chan *Stats, 128)
-	go processRepositories(client, options, repos, stats)
+	go processRepositories(client, pw, options, repos, stats)
 
 	accumulated := accumulateStatsPerUser(stats)
 
+	// wait until progress bar rendering is done
+	for pw.LengthActive() != 0 {
+	}
+	fmt.Printf("%d requests sent to Github\n", amountOfRequests.Load())
+	fmt.Printf("Rate Limit: remaining=%d reset=%v\n", ratelimitRemaining.Load(), ratelimitReset.Load())
 	showResults(accumulated)
 }
